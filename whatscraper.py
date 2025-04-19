@@ -4,6 +4,7 @@ import os
 import urllib.request
 import urllib.parse
 import threading
+import signal
 from datetime import datetime
 import argparse
 import json
@@ -16,6 +17,18 @@ except ImportError:
     print("    Please Install it by using:")
     print("\n    python3 -m pip install google")
     exit()
+
+# Global stop event for threads
+stop_event = threading.Event()
+
+# Signal handler for Ctrl+C
+def signal_handler(sig, frame):
+    print("\n[!] Received Ctrl+C, stopping threads and exiting...")
+    stop_event.set()  # Signal threads to stop
+    sys.exit(0)
+
+# Register signal handler
+signal.signal(signal.SIGINT, signal_handler)
 
 GROUP_NAME_REGEX = re.compile(r'(og:title\" content=\")(.*?)(\")')
 GROUP_IMAGE_REGEX = re.compile(r'(og:image\" content=\")(.*?)(\")')
@@ -62,15 +75,24 @@ site_urls = ["https://www.whatsapgrouplinks.com/",
 
 
 def linkcheck(url):
+    if stop_event.is_set():
+        print("[DEBUG] linkcheck: Stop event set, exiting")
+        return {"name": None, "url": url, "image": None}
     print("\nTrying URL:", url, end='\r')
     group_info = {"name": None, "url": url, "image": None}
     try:
-        hdr = {'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; Win64; x64)'}
+        hdr = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Referer': 'https://www.google.com/'
+        }
         req = urllib.request.Request(url, headers=hdr)
-        resp = urllib.request.urlopen(req)
-    except Exception:
+        resp = urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        print(f"[DEBUG] linkcheck: Failed to fetch {url}: {e}")
         return group_info
-    if (resp.getcode() != 404):
+    if resp.getcode() != 404:
         resp = resp.read().decode("utf-8")
         group_info["name"] = unescape(GROUP_NAME_REGEX.search(resp).group(2))
         group_info["image"] = unescape(GROUP_IMAGE_REGEX.search(resp).group(2))
@@ -85,6 +107,9 @@ def pad(s):
 
 
 def scrape(txt, download_image=False):
+    if stop_event.is_set():
+        print("[DEBUG] scrape: Stop event set, exiting")
+        return
     if isinstance(txt, bytes):
         txt = txt.decode("utf-8")
     match = []
@@ -93,6 +118,9 @@ def scrape(txt, download_image=False):
     match = [item[0] for item in match2]
     match = list(set(match))
     for lmt in match:
+        if stop_event.is_set():
+            print("[DEBUG] scrape: Stop event set in loop, breaking")
+            break
         lmt = pad(lmt)
         info = linkcheck(lmt)
         if info['name']:
@@ -100,51 +128,78 @@ def scrape(txt, download_image=False):
             print("[i] Group Link:  ", info['url'])
             print("[i] Group Image: ", info['image'])
             lock.acquire()
-            if SAVE.endswith(".json"):
-                with open(SAVE, "r+", encoding='utf-8') as jsonFile:
-                    data = json.load(jsonFile)
-                    data.append(info)
-                    jsonFile.seek(0)
-                    json.dump(data, jsonFile)
-                    jsonFile.truncate()
-            else:
-                with open(SAVE, "a", encoding='utf-8') as f:
-                    write_data = " | ".join(info.values())+"\n"
-                    f.write(write_data)
-            if download_image:
-                image_path = urllib.parse.urlparse(info['image'])
-                path, _ = urllib.request.urlretrieve(
-                    info["image"], os.path.basename(image_path.path))
-                print("[i] Image Path: ", path)
-            lock.release()
+            try:
+                if SAVE.endswith(".json"):
+                    with open(SAVE, "r+", encoding='utf-8') as jsonFile:
+                        data = json.load(jsonFile)
+                        data.append(info)
+                        jsonFile.seek(0)
+                        json.dump(data, jsonFile)
+                        jsonFile.truncate()
+                else:
+                    with open(SAVE, "a", encoding='utf-8') as f:
+                        write_data = " | ".join(info.values()) + "\n"
+                        f.write(write_data)
+                if download_image:
+                    image_path = urllib.parse.urlparse(info['image'])
+                    path, _ = urllib.request.urlretrieve(
+                        info["image"], os.path.basename(image_path.path), timeout=10)
+                    print("[i] Image Path: ", path)
+            finally:
+                lock.release()
 
 
 def scrap_from_google(index):
     print("[*] Initializing...")
-    if index >= len(availabledom):
+    if index >= len(availabledom) or stop_event.is_set():
+        print("[DEBUG] scrap_from_google: Stop event set or invalid index, exiting")
         return
     query = "intext:chat.whatsapp.com inurl:" + availabledom[index]
     print("[*] Querying Google By Dorks ...")
-    for url in search(query, tld="com", num=10, stop=None, pause=2):
-        hdr = {'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; Win64; x64)'}
-        req = urllib.request.Request(url, headers=hdr)
-        txt = urllib.request.urlopen(req).read().decode("utf8")
-        scrape(txt)
+    try:
+        for url in search(query, tld="com", num=5, stop=5, pause=1):
+            if stop_event.is_set():
+                print("[DEBUG] scrap_from_google: Stop event set in loop, breaking")
+                break
+            hdr = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Referer': 'https://www.google.com/'
+            }
+            req = urllib.request.Request(url, headers=hdr)
+            txt = urllib.request.urlopen(req, timeout=10).read().decode("utf8")
+            scrape(txt)
+    except Exception as e:
+        print(f"[DEBUG] scrap_from_google: Error during search: {e}")
 
 
 def scrap_from_link(index):
     print("[*] Initializing...")
-    if index >= len(site_urls):
+    if index >= len(site_urls) or stop_event.is_set():
+        print("[DEBUG] scrap_from_link: Stop event set or invalid index, exiting")
         return
-    r = urllib.request.urlopen(site_urls[index]).read().decode()
-    scrape(r)
+    print(f"[DEBUG] scrap_from_link: Fetching {site_urls[index]}")
+    try:
+        hdr = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Referer': 'https://www.google.com/'
+        }
+        req = urllib.request.Request(site_urls[index], headers=hdr)
+        r = urllib.request.urlopen(req, timeout=10).read().decode()
+        scrape(r)
+    except Exception as e:
+        print(f"[DEBUG] scrap_from_link: Error fetching {site_urls[index]}: {e}")
+        return  # Explicitly return to ensure thread exits
 
 
 def update_tool():
     print("[*] Updating Please Wait...")
     try:
         txt = urllib.request.urlopen(
-            "https://github.com/TheSpeedX/WhatScraper/raw/master/whatscraper.py").read()
+            "https://github.com/TheSpeedX/WhatScraper/raw/master/whatscraper.py", timeout=10).read()
         with open(sys.argv[0], "wb") as f:
             f.write(txt)
         print("[$] Update Successful")
@@ -158,13 +213,18 @@ def initialize_google_scrapper():
     threads = []
     size = len(availabledom)
     prompt = "[#] Enter the number of threads(1-" + str(size) + "):- "
-    thread_count = min(size, int(input(prompt)))
+    thread_count = min(size, int(input(prompt)) + 1)
     for i in range(thread_count):
         thread = threading.Thread(target=scrap_from_google, args=(i,))
+        thread.daemon = True
         thread.start()
         threads.append(thread)
     for i in threads:
-        i.join()
+        while i.is_alive() and not stop_event.is_set():
+            i.join(timeout=1.0)  # Check stop_event periodically
+        if stop_event.is_set():
+            print("[DEBUG] initialize_google_scrapper: Stop event set, exiting join")
+            break
 
 
 def initialize_site_scrapper():
@@ -174,11 +234,15 @@ def initialize_site_scrapper():
     thread_count = min(size, int(input(prompt)))
     for i in range(thread_count):
         thread = threading.Thread(target=scrap_from_link, args=(i,))
+        thread.daemon = True
         thread.start()
         threads.append(thread)
-
     for i in threads:
-        i.join()
+        while i.is_alive() and not stop_event.is_set():
+            i.join(timeout=1.0)  # Check stop_event periodically
+        if stop_event.is_set():
+            print("[DEBUG] initialize_site_scrapper: Stop event set, exiting join")
+            break
 
 
 def initialize_file_scrapper():
@@ -195,13 +259,19 @@ def initialize_file_scrapper():
             head = [next(strm) for x in range(op)]
             thread = threading.Thread(
                 target=scrape, args=(b'\n'.join(head),))
+            thread.daemon = True
             thread.start()
             threads.append(thread)
         thread = threading.Thread(target=scrape, args=(strm.read(),))
+        thread.daemon = True
         thread.start()
         threads.append(thread)
     for i in threads:
-        i.join()
+        while i.is_alive() and not stop_event.is_set():
+            i.join(timeout=1.0)  # Check stop_event periodically
+        if stop_event.is_set():
+            print("[DEBUG] initialize_file_scrapper: Stop event set, exiting join")
+            break
 
 
 def main():
@@ -221,7 +291,7 @@ def main():
         scrape(args.link, download_image=True)
         return
     if args.json:
-        SAVE = SAVE.split(".")[0]+".json"
+        SAVE = SAVE.split(".")[0] + ".json"
         with open(SAVE, "w", encoding='utf-8') as jsonFile:
             json.dump([], jsonFile)
     print("""
@@ -233,20 +303,25 @@ def main():
 
     try:
         inp = int(input("[#] Enter Choice: "))
-    except Exception:
+    except ValueError:
         print("\t[!] Invalid Choice..")
         exit()
 
-    if inp == 1:
-        initialize_google_scrapper()
-    elif inp == 2:
-        initialize_site_scrapper()
-    elif inp == 3:
-        initialize_file_scrapper()
-    elif inp == 4:
-        update_tool()
-    else:
-        print("[!] Invalid Choice..")
+    try:
+        if inp == 1:
+            initialize_google_scrapper()
+        elif inp == 2:
+            initialize_site_scrapper()
+        elif inp == 3:
+            initialize_file_scrapper()
+        elif inp == 4:
+            update_tool()
+        else:
+            print("[!] Invalid Choice..")
+    except KeyboardInterrupt:
+        print("\n[!] Received Ctrl+C in main, stopping threads and exiting...")
+        stop_event.set()
+        sys.exit(0)
 
 
 if __name__ == "__main__":
